@@ -417,27 +417,137 @@ def make_robustness_tests() -> dict[str, Callable]:
     }
 
 
-def evaluate_robustness(detector: Callable, images, files, titles, gt_dir: Path, tests=None, tolerance_px=5):
-    """Evaluate every perturbed image against the same human ground truth."""
+# def evaluate_robustness(detector: Callable, images, files, titles, gt_dir: Path, tests=None, tolerance_px=5):
+#     """Evaluate every perturbed image against the same human ground truth."""
+#     if tests is None:
+#         tests = make_robustness_tests()
+
+#     rows = []
+#     for condition, perturb in tests.items():
+#         for image, file, title in zip(images, files, titles):
+#             gt = load_ground_truth(file, gt_dir)
+#             prediction = detector(perturb(np.asarray(image).copy()))
+#             metrics = boundary_metrics(prediction, gt, tolerance_px=tolerance_px)
+#             rows.append(
+#                 {
+#                     "condition": condition,
+#                     "image": title,
+#                     "precision": metrics["precision"],
+#                     "recall": metrics["recall"],
+#                     "f1": metrics["f1"],
+#                     "mean_boundary_error_px": metrics["mean_symmetric_boundary_error"],
+#                 }
+#             )
+#     return pd.DataFrame(rows)
+
+
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+
+def evaluate_robustness(
+    detector,
+    images,
+    files,
+    titles,
+    gt_dir: Path,
+    tests=None,
+    tolerance_px=5,
+    n_jobs=None,
+):
+    """
+    Faster robustness evaluation.
+
+    Improvements:
+    1. Ground truth is loaded only once per image.
+    2. Images are converted to NumPy only once.
+    3. Conditions/images are evaluated in parallel.
+    """
+
     if tests is None:
         tests = make_robustness_tests()
 
-    rows = []
-    for condition, perturb in tests.items():
-        for image, file, title in zip(images, files, titles):
-            gt = load_ground_truth(file, gt_dir)
-            prediction = detector(perturb(np.asarray(image).copy()))
-            metrics = boundary_metrics(prediction, gt, tolerance_px=tolerance_px)
-            rows.append(
-                {
-                    "condition": condition,
-                    "image": title,
-                    "precision": metrics["precision"],
-                    "recall": metrics["recall"],
-                    "f1": metrics["f1"],
-                    "mean_boundary_error_px": metrics["mean_symmetric_boundary_error"],
-                }
+    # ------------------------------------------------------------
+    # Cache everything that does not change between conditions
+    # ------------------------------------------------------------
+    images_np = [
+        np.asarray(image)
+        for image in images
+    ]
+
+    ground_truths = [
+        load_ground_truth(file, gt_dir)
+        for file in files
+    ]
+
+    # ------------------------------------------------------------
+    # One evaluation job
+    # ------------------------------------------------------------
+    def evaluate_one(condition, perturb, image, gt, title):
+
+        perturbed = perturb(image.copy())
+
+        prediction = detector(perturbed)
+
+        metrics = boundary_metrics(
+            prediction,
+            gt,
+            tolerance_px=tolerance_px,
+        )
+
+        return {
+            "condition": condition,
+            "image": title,
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "f1": metrics["f1"],
+            "mean_boundary_error_px":
+                metrics["mean_symmetric_boundary_error"],
+        }
+
+    # ------------------------------------------------------------
+    # Create jobs
+    # ------------------------------------------------------------
+    jobs = [
+        (
+            condition,
+            perturb,
+            image,
+            gt,
+            title,
+        )
+        for condition, perturb in tests.items()
+        for image, gt, title in zip(
+            images_np,
+            ground_truths,
+            titles,
+        )
+    ]
+
+    # ------------------------------------------------------------
+    # Run jobs in parallel
+    # ------------------------------------------------------------
+    with ThreadPoolExecutor(max_workers=n_jobs) as executor:
+
+        futures = [
+            executor.submit(
+                evaluate_one,
+                condition,
+                perturb,
+                image,
+                gt,
+                title,
             )
+            for condition, perturb, image, gt, title in jobs
+        ]
+
+        rows = [
+            future.result()
+            for future in futures
+        ]
+
     return pd.DataFrame(rows)
 
 
