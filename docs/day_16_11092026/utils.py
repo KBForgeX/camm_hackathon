@@ -417,36 +417,6 @@ def make_robustness_tests() -> dict[str, Callable]:
     }
 
 
-# def evaluate_robustness(detector: Callable, images, files, titles, gt_dir: Path, tests=None, tolerance_px=5):
-#     """Evaluate every perturbed image against the same human ground truth."""
-#     if tests is None:
-#         tests = make_robustness_tests()
-
-#     rows = []
-#     for condition, perturb in tests.items():
-#         for image, file, title in zip(images, files, titles):
-#             gt = load_ground_truth(file, gt_dir)
-#             prediction = detector(perturb(np.asarray(image).copy()))
-#             metrics = boundary_metrics(prediction, gt, tolerance_px=tolerance_px)
-#             rows.append(
-#                 {
-#                     "condition": condition,
-#                     "image": title,
-#                     "precision": metrics["precision"],
-#                     "recall": metrics["recall"],
-#                     "f1": metrics["f1"],
-#                     "mean_boundary_error_px": metrics["mean_symmetric_boundary_error"],
-#                 }
-#             )
-#     return pd.DataFrame(rows)
-
-
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-import numpy as np
-import pandas as pd
-
-
 def evaluate_robustness(
     detector,
     images,
@@ -455,98 +425,167 @@ def evaluate_robustness(
     gt_dir: Path,
     tests=None,
     tolerance_px=5,
-    n_jobs=None,
+    max_images=4,
 ):
     """
-    Faster robustness evaluation.
+    Lightweight robustness evaluation designed for Colab.
 
-    Improvements:
-    1. Ground truth is loaded only once per image.
-    2. Images are converted to NumPy only once.
-    3. Conditions/images are evaluated in parallel.
+    - Uses only a representative subset of images.
+    - Loads ground truth once.
+    - Caches GT distance transforms.
+    - No multiprocessing / high compute.
     """
 
     if tests is None:
         tests = make_robustness_tests()
 
     # ------------------------------------------------------------
-    # Cache everything that does not change between conditions
+    # Select representative images
     # ------------------------------------------------------------
-    images_np = [
-        np.asarray(image)
-        for image in images
+    n = len(images)
+
+    if max_images is not None and n > max_images:
+        indices = np.linspace(
+            0,
+            n - 1,
+            max_images,
+            dtype=int,
+        )
+    else:
+        indices = np.arange(n)
+
+    selected_images = [
+        np.asarray(images[i])
+        for i in indices
     ]
 
+    selected_files = [
+        files[i]
+        for i in indices
+    ]
+
+    selected_titles = [
+        titles[i]
+        for i in indices
+    ]
+
+    # ------------------------------------------------------------
+    # Load GT once
+    # ------------------------------------------------------------
     ground_truths = [
-        load_ground_truth(file, gt_dir)
-        for file in files
+        np.asarray(
+            load_ground_truth(file, gt_dir),
+            dtype=bool,
+        )
+        for file in selected_files
     ]
 
     # ------------------------------------------------------------
-    # One evaluation job
+    # Cache distance-to-GT maps
+    # This never changes across perturbations.
     # ------------------------------------------------------------
-    def evaluate_one(condition, perturb, image, gt, title):
+    gt_distance_maps = [
+        ndimage.distance_transform_edt(~gt)
+        for gt in ground_truths
+    ]
 
-        perturbed = perturb(image.copy())
-
-        prediction = detector(perturbed)
-
-        metrics = boundary_metrics(
-            prediction,
-            gt,
-            tolerance_px=tolerance_px,
-        )
-
-        return {
-            "condition": condition,
-            "image": title,
-            "precision": metrics["precision"],
-            "recall": metrics["recall"],
-            "f1": metrics["f1"],
-            "mean_boundary_error_px":
-                metrics["mean_symmetric_boundary_error"],
-        }
+    rows = []
 
     # ------------------------------------------------------------
-    # Create jobs
+    # Run robustness conditions
     # ------------------------------------------------------------
-    jobs = [
-        (
-            condition,
-            perturb,
-            image,
-            gt,
-            title,
-        )
-        for condition, perturb in tests.items()
-        for image, gt, title in zip(
-            images_np,
+    for condition, perturb in tests.items():
+
+        for image, gt, gt_dist, title in zip(
+            selected_images,
             ground_truths,
-            titles,
-        )
-    ]
+            gt_distance_maps,
+            selected_titles,
+        ):
 
-    # ------------------------------------------------------------
-    # Run jobs in parallel
-    # ------------------------------------------------------------
-    with ThreadPoolExecutor(max_workers=n_jobs) as executor:
+            perturbed = perturb(image.copy())
 
-        futures = [
-            executor.submit(
-                evaluate_one,
-                condition,
-                perturb,
-                image,
-                gt,
-                title,
+            prediction = np.asarray(
+                detector(perturbed),
+                dtype=bool,
             )
-            for condition, perturb, image, gt, title in jobs
-        ]
 
-        rows = [
-            future.result()
-            for future in futures
-        ]
+            # ----------------------------------------------------
+            # Prediction -> GT
+            # ----------------------------------------------------
+            if prediction.any():
+                pred_to_gt = gt_dist[prediction]
+
+                precision = np.mean(
+                    pred_to_gt <= tolerance_px
+                )
+
+                mean_pred_to_gt = np.mean(
+                    pred_to_gt
+                )
+            else:
+                precision = 0.0
+                mean_pred_to_gt = np.nan
+
+            # ----------------------------------------------------
+            # GT -> Prediction
+            # Only one distance transform needed per prediction
+            # ----------------------------------------------------
+            if prediction.any():
+                pred_dist = ndimage.distance_transform_edt(
+                    ~prediction
+                )
+
+                gt_to_pred = pred_dist[gt]
+
+                recall = np.mean(
+                    gt_to_pred <= tolerance_px
+                )
+
+                mean_gt_to_pred = np.mean(
+                    gt_to_pred
+                )
+            else:
+                recall = 0.0
+                mean_gt_to_pred = np.nan
+
+            # ----------------------------------------------------
+            # F1
+            # ----------------------------------------------------
+            if precision + recall > 0:
+                f1 = (
+                    2
+                    * precision
+                    * recall
+                    / (precision + recall)
+                )
+            else:
+                f1 = 0.0
+
+            # ----------------------------------------------------
+            # Symmetric boundary error
+            # ----------------------------------------------------
+            if (
+                np.isfinite(mean_pred_to_gt)
+                and np.isfinite(mean_gt_to_pred)
+            ):
+                mean_error = 0.5 * (
+                    mean_pred_to_gt
+                    + mean_gt_to_pred
+                )
+            else:
+                mean_error = np.nan
+
+            rows.append(
+                {
+                    "condition": condition,
+                    "image": title,
+                    "precision": precision,
+                    "recall": recall,
+                    "f1": f1,
+                    "mean_boundary_error_px": mean_error,
+                }
+            )
 
     return pd.DataFrame(rows)
 
