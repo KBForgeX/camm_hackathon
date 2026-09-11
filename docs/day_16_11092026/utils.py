@@ -260,7 +260,7 @@ def plot_boundary_result(image, boundary, title="", display_dilation=3):
         vmax=np.percentile(image, 99.5),
     )
     overlay = np.ma.masked_where(~boundary_display, boundary_display)
-    ax.imshow(overlay, cmap="Reds", alpha=1.0, vmin=0, vmax=1)
+    ax.imshow(overlay, cmap="autumn", alpha=1.0, vmin=0, vmax=1)
     ax.set_title(title)
     ax.axis("off")
     plt.show()
